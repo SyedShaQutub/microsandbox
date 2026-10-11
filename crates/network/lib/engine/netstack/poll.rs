@@ -276,6 +276,7 @@ pub fn smoltcp_poll_loop(
     // so `DestinationGroup::Host` rules can resolve to the right address.
     shared.set_gateway_ips(config.gateway.ipv4, config.gateway.ipv6);
     let network_policy = policy.load();
+    let mut enforced_policy = network_policy.clone();
     let platform_policy = platform_policy.map(Arc::new);
 
     let (mut dns_interceptor, dns_forwarder_handle) = DnsInterceptor::new(
@@ -351,8 +352,17 @@ pub fn smoltcp_poll_loop(
 
     loop {
         let now = smoltcp_now();
-        // A policy set on the running sandbox decides every flow evaluated from here on.
+        // A policy set on the running sandbox decides every flow evaluated from here on, and
+        // the open flows it now denies end.
         let network_policy = policy.load();
+        if !Arc::ptr_eq(&network_policy, &enforced_policy) {
+            conn_tracker.abort_denied(&mut sockets, |dst| {
+                network_policy
+                    .evaluate_egress(dst, Protocol::Tcp, &shared)
+                    .is_deny()
+            });
+            enforced_policy = network_policy.clone();
+        }
 
         // ── Phase 1: Drain all guest frames with pre-inspection ──────────
         while let Some(frame) = device.stage_next_frame() {

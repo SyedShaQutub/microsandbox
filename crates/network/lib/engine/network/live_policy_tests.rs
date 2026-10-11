@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use msb_krun::backends::net::{NetBackend, ReadError};
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
@@ -113,6 +113,11 @@ impl Guest {
 
     /// Whether a new TCP connection from the guest to the host's `port` is established.
     async fn connects_to_host(&mut self, port: u16) -> bool {
+        self.open_to_host(port).await.is_some()
+    }
+
+    /// A new TCP connection from the guest to the host's `port`, once established.
+    async fn open_to_host(&mut self, port: u16) -> Option<SocketHandle> {
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; 1024]),
             tcp::SocketBuffer::new(vec![0; 1024]),
@@ -131,12 +136,32 @@ impl Guest {
             let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
             self.iface.poll(now, &mut self.device, &mut self.sockets);
             match self.sockets.get::<tcp::Socket>(handle).state() {
-                tcp::State::Established => return true,
-                tcp::State::Closed | tcp::State::TimeWait => return false,
-                _ if tokio::time::Instant::now() >= deadline => return false,
+                tcp::State::Established => return Some(handle),
+                tcp::State::Closed | tcp::State::TimeWait => return None,
+                _ if tokio::time::Instant::now() >= deadline => return None,
                 _ => tokio::time::sleep(Duration::from_millis(1)).await,
             }
         }
+    }
+
+    fn state(&mut self, handle: SocketHandle) -> tcp::State {
+        let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.sockets.get::<tcp::Socket>(handle).state()
+    }
+
+    /// Whether the network ends this established connection within a few seconds.
+    async fn ends(&mut self, handle: SocketHandle) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
+            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            if self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::Established {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
     }
 }
 
@@ -193,5 +218,49 @@ async fn a_policy_set_on_a_running_network_decides_its_next_connection() {
     assert!(
         !guest.connects_to_host(port).await,
         "a connection opened after the policy was closed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_policy_ends_a_connection_it_now_denies() {
+    let port = host_service().await;
+    let mut network = running_network(NetworkPolicy::allow_all());
+    let policy = network.policy_handle();
+    let mut guest = Guest::attach(&mut network);
+    network.start(tokio::runtime::Handle::current());
+
+    let open = guest
+        .open_to_host(port)
+        .await
+        .expect("the open policy refused it");
+    policy.set(NetworkPolicy::none());
+    assert!(
+        guest.ends(open).await,
+        "a connection the new policy denies stayed open"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn narrowing_leaves_open_a_connection_the_new_policy_still_allows() {
+    let (kept_port, ended_port) = (host_service().await, host_service().await);
+    let mut network = running_network(NetworkPolicy::allow_all());
+    let policy = network.policy_handle();
+    let mut guest = Guest::attach(&mut network);
+    network.start(tokio::runtime::Handle::current());
+
+    let kept = guest.open_to_host(kept_port).await.expect("refused");
+    let ended = guest.open_to_host(ended_port).await.expect("refused");
+    policy.set(
+        NetworkPolicy::builder()
+            .default_deny()
+            .egress(|e| e.tcp().port(kept_port).allow_host())
+            .build()
+            .unwrap(),
+    );
+    assert!(guest.ends(ended).await, "the denied connection stayed open");
+    assert_eq!(
+        guest.state(kept),
+        tcp::State::Established,
+        "narrowing ended a connection the new policy still allows"
     );
 }

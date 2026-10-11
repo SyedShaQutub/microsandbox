@@ -606,6 +606,28 @@ impl TcpConnectionTracker {
             }
         });
     }
+
+    /// End every open connection whose destination `denies` now refuses: the guest gets an
+    /// RST and the host-side proxy task's channels close, so it exits. Used when a running
+    /// sandbox's policy narrows. Returns how many connections were ended.
+    pub fn abort_denied(
+        &mut self,
+        sockets: &mut SocketSet<'_>,
+        mut denies: impl FnMut(SocketAddr) -> bool,
+    ) -> usize {
+        let mut ended = 0;
+        for (&handle, conn) in self.connections.iter_mut() {
+            if conn.policy_denied || !denies(conn.dst) {
+                continue;
+            }
+            sockets.get_mut::<tcp::Socket>(handle).abort();
+            conn.to_proxy = None;
+            conn.from_proxy.close();
+            conn.proxy_channels = None;
+            ended += 1;
+        }
+        ended
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
