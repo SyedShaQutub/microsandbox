@@ -434,6 +434,13 @@ compatible_v2!(
     }),
     |reply| decode_json_field(reply, "compaction")
 );
+compatible_v2!(
+    UpdateNetworkPolicy,
+    |request: &UpdateNetworkPolicy| serde_json::json!({
+        "op": "network_policy_update", "policy": request.0.policy,
+    }),
+    decode_network_policy_json
+);
 
 impl CompatibleControlRequest for ResumeRuntime {
     fn min_generation(&self) -> u8 {
@@ -534,6 +541,13 @@ fn decode_branch_json(reply: JsonReply) -> ControlClientResult<BranchResult> {
         .and_then(|value| value.get("branch").cloned())
         .and_then(|value| serde_json::from_value(value).ok());
     reply.checked(|_| path.map(|path| BranchResult { path }))
+}
+
+fn decode_network_policy_json(reply: JsonReply) -> ControlClientResult<Empty> {
+    let updated = serde_json::from_slice::<serde_json::Value>(reply.raw())
+        .ok()
+        .and_then(|value| value.get("network_policy_updated")?.as_bool());
+    reply.checked(|_| (updated == Some(true)).then_some(Empty {}))
 }
 
 fn decode_checkpoint_json(reply: JsonReply) -> ControlClientResult<CheckpointResult> {
