@@ -285,7 +285,7 @@ pub fn smoltcp_poll_loop(
         shared.clone(),
         &tokio_handle,
         gateway_ips,
-        network_policy.clone(),
+        policy.clone(),
         platform_policy.clone(),
         config.gateway,
         config.gateway_mac,

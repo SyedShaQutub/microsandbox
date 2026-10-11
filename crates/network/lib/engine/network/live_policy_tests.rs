@@ -3,10 +3,13 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+use hickory_net::proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_net::proto::rr::{DNSClass, Name, RecordType};
+use hickory_net::proto::serialize::binary::{BinDecodable, BinEncodable};
 use msb_krun::backends::net::{NetBackend, ReadError};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use tokio::io::AsyncWriteExt;
@@ -144,6 +147,42 @@ impl Guest {
         }
     }
 
+    /// The response code the network's resolver gives this guest for an A query on `name`.
+    async fn dns_rcode(&mut self, name: &str) -> Option<ResponseCode> {
+        let mut query = Message::new(0x5151, MessageType::Query, OpCode::Query);
+        query.metadata.recursion_desired = true;
+        let mut question = Query::new();
+        question.set_name(Name::from_ascii(name).unwrap());
+        question.set_query_type(RecordType::A);
+        question.set_query_class(DNSClass::IN);
+        query.add_query(question);
+        let mut socket = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
+        );
+        socket.bind(self.next_port).unwrap();
+        self.next_port += 1;
+        socket
+            .send_slice(
+                &query.to_bytes().unwrap(),
+                (IpAddress::from(self.gateway), 53),
+            )
+            .unwrap();
+        let handle = self.sockets.add(socket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
+            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            let socket = self.sockets.get_mut::<udp::Socket>(handle);
+            if socket.can_recv() {
+                let (bytes, _) = socket.recv().unwrap();
+                return Some(Message::from_bytes(bytes).unwrap().metadata.response_code);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        None
+    }
+
     fn state(&mut self, handle: SocketHandle) -> tcp::State {
         let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -262,5 +301,25 @@ async fn narrowing_leaves_open_a_connection_the_new_policy_still_allows() {
         guest.state(kept),
         tcp::State::Established,
         "narrowing ended a connection the new policy still allows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_query_after_the_policy_closes_is_refused() {
+    let mut network = running_network(NetworkPolicy::allow_all());
+    let policy = network.policy_handle();
+    let mut guest = Guest::attach(&mut network);
+    network.start(tokio::runtime::Handle::current());
+
+    assert_eq!(
+        guest.dns_rcode(crate::HOST_ALIAS).await,
+        Some(ResponseCode::NoError),
+        "the open policy did not answer the host alias"
+    );
+    policy.set(NetworkPolicy::none());
+    assert_eq!(
+        guest.dns_rcode(crate::HOST_ALIAS).await,
+        Some(ResponseCode::NXDomain),
+        "a query after the policy closed was answered"
     );
 }
