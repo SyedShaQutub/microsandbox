@@ -4,8 +4,8 @@ use microsandbox_protocol::{
     control::{
         BranchCreate, BranchResult, Capabilities, CheckpointCreate, CheckpointResult, ControlError,
         CpuState, CpuTarget, DiskCheckpointCreate, DiskCheckpointState, DiskCompact, Empty,
-        MemoryState, MemoryTarget, Pause, PauseState, RootDiskGrow, RootDiskState,
-        RuntimeCapabilities, SecretChange, SecretsResult,
+        MemoryState, MemoryTarget, NetworkPolicyUpdate, Pause, PauseState, RootDiskGrow,
+        RootDiskState, RuntimeCapabilities, SecretChange, SecretsResult,
     },
     wire,
 };
@@ -73,6 +73,10 @@ pub struct GetPauseState;
 /// Grow the owned root disk and filesystem.
 #[derive(Debug, Clone, Copy)]
 pub struct GrowRootDisk(pub RootDiskGrow);
+
+/// Replace the running sandbox's network policy.
+#[derive(Debug, Clone)]
+pub struct UpdateNetworkPolicy(pub NetworkPolicyUpdate);
 /// Compact selected owned disk chains.
 #[derive(Debug, Clone)]
 pub struct CompactDisks(pub DiskCompact);
@@ -297,6 +301,12 @@ v2_request!(
     RootDiskState,
     "control.root-disk.grow",
     "control.root-disk.state"
+);
+v2_request!(
+    UpdateNetworkPolicy,
+    Empty,
+    "control.network.policy.update",
+    "control.network.policy.result"
 );
 v2_request!(
     CompactDisks,
