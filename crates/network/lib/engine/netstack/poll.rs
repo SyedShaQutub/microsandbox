@@ -301,7 +301,7 @@ pub fn smoltcp_poll_loop(
         config.gateway.ipv6,
         config.gateway_mac,
         config.guest_mac,
-        network_policy.clone(),
+        policy.clone(),
         shared.clone(),
         &tokio_handle,
     );
