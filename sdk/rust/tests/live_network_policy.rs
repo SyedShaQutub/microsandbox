@@ -108,3 +108,25 @@ async fn a_sandbox_booted_without_network_gains_it_when_its_policy_is_opened() {
         "the guest could not reach the host after its policy opened"
     );
 }
+
+#[msb_test]
+async fn an_old_handle_cannot_change_a_sandbox_that_replaced_it_under_the_same_name() {
+    let port = host_service().await;
+    let name = "live-policy-replaced";
+    let old = spawn_sandbox(name, NetworkPolicy::allow_all()).await;
+    old.stop().await.expect("stop the first sandbox");
+    let new = spawn_sandbox(name, NetworkPolicy::allow_all()).await;
+
+    let refused = old.set_network_policy(&NetworkPolicy::none()).await;
+    let reached = reaches_host(&new, port).await;
+
+    teardown(new, name).await;
+    assert!(
+        matches!(
+            refused,
+            Err(microsandbox::MicrosandboxError::SandboxReplaced { .. })
+        ),
+        "{refused:?}"
+    );
+    assert!(reached, "the old handle closed the replacement's network");
+}

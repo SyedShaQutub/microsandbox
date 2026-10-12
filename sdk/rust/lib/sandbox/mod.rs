@@ -919,7 +919,11 @@ impl Sandbox {
     /// next start uses its configured policy.
     #[cfg(all(feature = "local", feature = "net"))]
     pub async fn set_network_policy(&self, policy: &NetworkPolicy) -> MicrosandboxResult<()> {
-        network_policy::set(self.backend.as_ref(), &self.name, policy).await
+        let sandbox_id = match self.identity() {
+            SandboxIdentity::Local(id) => Some(id),
+            SandboxIdentity::Cloud(_) => None,
+        };
+        network_policy::set(self.backend.as_ref(), &self.name, sandbox_id, policy).await
     }
 
     /// Request graceful shutdown and wait without a built-in deadline for completion.
