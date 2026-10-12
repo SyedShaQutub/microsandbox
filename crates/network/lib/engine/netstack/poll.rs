@@ -356,10 +356,19 @@ pub fn smoltcp_poll_loop(
         // the open flows it now denies end.
         let network_policy = policy.load();
         if !Arc::ptr_eq(&network_policy, &enforced_policy) {
-            conn_tracker.abort_denied(&mut sockets, |dst| {
-                network_policy
+            conn_tracker.abort_denied(&mut sockets, |dst, hostname| match hostname {
+                Some(name) => matches!(
+                    network_policy.evaluate_egress_with_source(
+                        dst,
+                        Protocol::Tcp,
+                        &shared,
+                        HostnameSource::Sni(name),
+                    ),
+                    EgressEvaluation::Deny
+                ),
+                None => network_policy
                     .evaluate_egress(dst, Protocol::Tcp, &shared)
-                    .is_deny()
+                    .is_deny(),
             });
             enforced_policy = network_policy.clone();
         }

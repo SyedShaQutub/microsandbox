@@ -164,6 +164,7 @@ impl TlsProxy {
 
         // Canonicalize so byte equality against rule destinations works.
         let sni_name = sni_name.trim_end_matches('.').to_ascii_lowercase();
+        proxy_connect.record_hostname(&sni_name);
 
         if let Some(expected) = expected_sni.as_deref()
             && !sni_name.eq_ignore_ascii_case(expected.trim_end_matches('.'))

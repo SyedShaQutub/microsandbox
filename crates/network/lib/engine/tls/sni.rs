@@ -113,11 +113,11 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
 //--------------------------------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    /// A minimal TLS 1.2 ClientHello with SNI "example.com".
-    fn build_client_hello(hostname: &str) -> Vec<u8> {
+    /// A minimal TLS 1.2 ClientHello with SNI `hostname`.
+    pub(crate) fn build_client_hello(hostname: &str) -> Vec<u8> {
         let hostname_bytes = hostname.as_bytes();
 
         // SNI extension.

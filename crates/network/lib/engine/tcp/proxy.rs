@@ -234,6 +234,9 @@ impl TcpProxy {
         // refines over-allow when the cache matched a shared CDN IP;
         // CacheOnly is the non-TLS fallback path so Domain rules still
         // gate plain HTTP / SSH / etc.
+        if let Some(name) = sni.as_deref() {
+            proxy_connect.record_hostname(name);
+        }
         if hostname_policy_deferred {
             let source = match sni.as_deref() {
                 Some(name) => HostnameSource::Sni(name),
@@ -428,6 +431,10 @@ impl TcpProxy {
         };
 
         // Replay the buffered first flight — run through secrets handler first.
+        let mut named = !initial_buf.is_empty();
+        if let Some(name) = crate::engine::tls::sni::extract_sni(&initial_buf) {
+            proxy_connect.record_hostname(&name);
+        }
         if !initial_buf.is_empty() {
             let out: Cow<[u8]> = match secrets_handler.as_mut() {
                 Some(h) => match h.substitute(&initial_buf) {
@@ -468,6 +475,12 @@ impl TcpProxy {
                 data = from_smoltcp.recv(), if !guest_eof => {
                     match data {
                         Some(bytes) => {
+                            if !named {
+                                named = true;
+                                if let Some(name) = crate::engine::tls::sni::extract_sni(&bytes) {
+                                    proxy_connect.record_hostname(&name);
+                                }
+                            }
                             if let Some(tls_state) = late_connect_state.take()
                                 && could_be_connect_request(&bytes)
                             {

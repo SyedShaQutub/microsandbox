@@ -183,6 +183,23 @@ impl Guest {
         None
     }
 
+    /// Write `data` on an established connection and poll until it has left the guest.
+    async fn send(&mut self, handle: SocketHandle, data: &[u8]) {
+        self.sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(data)
+            .unwrap();
+        for _ in 0..500 {
+            let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
+            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            if self.sockets.get::<tcp::Socket>(handle).send_queue() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the guest could not send its data");
+    }
+
     fn state(&mut self, handle: SocketHandle) -> tcp::State {
         let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -321,5 +338,34 @@ async fn a_dns_query_after_the_policy_closes_is_refused() {
         guest.dns_rcode(crate::HOST_ALIAS).await,
         Some(ResponseCode::NXDomain),
         "a query after the policy closed was answered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hostname_denied_after_a_tls_connection_opened_ends_it() {
+    let port = host_service().await;
+    let mut network = running_network(NetworkPolicy::allow_all());
+    let policy = network.policy_handle();
+    let mut guest = Guest::attach(&mut network);
+    network.start(tokio::runtime::Handle::current());
+
+    let open = guest
+        .open_to_host(port)
+        .await
+        .expect("the open policy refused it");
+    let hello = crate::engine::tls::sni::tests::build_client_hello("blocked.test");
+    guest.send(open, &hello).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    policy.set(
+        NetworkPolicy::builder()
+            .default_allow()
+            .egress(|e| e.deny_domains(["blocked.test"]))
+            .build()
+            .unwrap(),
+    );
+
+    assert!(
+        guest.ends(open).await,
+        "a connection to a host the new policy denies by name stayed open"
     );
 }

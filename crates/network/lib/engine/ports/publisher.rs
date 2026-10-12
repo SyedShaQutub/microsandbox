@@ -27,8 +27,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{ConnectionLimit, PortProtocol, PublishedPort, TcpAcceptQueueSize};
 use crate::netstack::shared::SharedState;
+use crate::policy::Protocol;
 use crate::policy::handle::PolicyHandle;
-use crate::policy::{NetworkPolicy, Protocol};
 use crate::tcp::deferred_close::DeferredClose;
 use crate::udp::relay::{construct_udp_response, extract_udp_payload};
 
@@ -1150,6 +1150,7 @@ fn write_host_data(socket: &mut tcp::Socket<'_>, relay: &mut InboundRelay) {
 
 #[cfg(test)]
 mod tests {
+    use crate::policy::NetworkPolicy;
     use smoltcp::iface::Config;
     use smoltcp::phy::{Loopback, Medium};
     use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
