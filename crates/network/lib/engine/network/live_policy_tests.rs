@@ -1,6 +1,6 @@
 //! A running sandbox's network policy, changed live through the real network engine.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use hickory_net::proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -16,6 +16,8 @@ use tokio::io::AsyncWriteExt;
 
 use super::{HostRoutes, SmoltcpNetwork};
 use crate::config::{EnvNetworkSecretResolver, NetworkConfig};
+use crate::engine::tls::sni::tests::build_client_hello;
+use crate::netstack::shared::ResolvedHostnameFamily;
 use crate::policy::NetworkPolicy;
 
 //--------------------------------------------------------------------------------------------------
@@ -164,16 +166,27 @@ impl Guest {
 
     /// Whether the network ends this established connection within a few seconds.
     async fn ends(&mut self, handle: SocketHandle) -> bool {
+        self.ended(&[handle]).await[0]
+    }
+
+    /// For each of these established connections, whether the network ends it within a few
+    /// seconds.
+    async fn ended(&mut self, handles: &[SocketHandle]) -> Vec<bool> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
+        loop {
             let now = Instant::from_millis(self.started.elapsed().as_millis() as i64);
             self.iface.poll(now, &mut self.device, &mut self.sockets);
-            if self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::Established {
-                return true;
+            let ended: Vec<bool> = handles
+                .iter()
+                .map(|&handle| {
+                    self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::Established
+                })
+                .collect();
+            if ended.iter().all(|&ended| ended) || tokio::time::Instant::now() >= deadline {
+                return ended;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        false
     }
 }
 
@@ -256,6 +269,46 @@ fn running_network(policy: NetworkPolicy) -> SmoltcpNetwork {
         },
     )
     .unwrap()
+}
+
+/// Opens one connection under `allow_all()` for each server name in `presented`, which it
+/// sends in a ClientHello, then replaces the policy with `narrowed`. Only `example.com`
+/// resolves to the address the guest dials, so every other name is judged by the server name
+/// the connection recorded and never by the DNS cache. Returns the names whose connection the
+/// new policy ended.
+async fn ended_by_narrowing(presented: &[&str], narrowed: NetworkPolicy) -> Vec<String> {
+    let port = host_service().await;
+    let mut network = running_network(NetworkPolicy::allow_all());
+    let policy = network.policy_handle();
+    let mut guest = Guest::attach(&mut network);
+    network.shared.cache_resolved_hostname(
+        "example.com",
+        ResolvedHostnameFamily::Ipv4,
+        [IpAddr::V4(guest.gateway)],
+        Duration::from_secs(60),
+    );
+    network.start(tokio::runtime::Handle::current());
+
+    let mut opened = Vec::new();
+    for name in presented {
+        let handle = guest
+            .open_to_host(port)
+            .await
+            .expect("the open policy refused it");
+        guest.send(handle, &build_client_hello(name)).await;
+        opened.push(handle);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    policy.set(narrowed);
+
+    let ended = guest.ended(&opened).await;
+
+    presented
+        .iter()
+        .zip(ended)
+        .filter(|(_, ended)| *ended)
+        .map(|(name, _)| name.to_string())
+        .collect()
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -347,29 +400,41 @@ async fn a_dns_query_after_the_policy_closes_is_refused() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hostname_denied_after_a_tls_connection_opened_ends_it() {
-    let port = host_service().await;
-    let mut network = running_network(NetworkPolicy::allow_all());
-    let policy = network.policy_handle();
-    let mut guest = Guest::attach(&mut network);
-    network.start(tokio::runtime::Handle::current());
+    let presented = ["blocked.test", "BLOCKED.test", "blocked.test."];
 
-    let open = guest
-        .open_to_host(port)
-        .await
-        .expect("the open policy refused it");
-    let hello = crate::engine::tls::sni::tests::build_client_hello("blocked.test");
-    guest.send(open, &hello).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    policy.set(
+    let ended = ended_by_narrowing(
+        &presented,
         NetworkPolicy::builder()
             .default_allow()
             .egress(|e| e.deny_domains(["blocked.test"]))
             .build()
             .unwrap(),
-    );
+    )
+    .await;
 
-    assert!(
-        guest.ends(open).await,
+    assert_eq!(
+        ended, presented,
         "a connection to a host the new policy denies by name stayed open"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn narrowing_keeps_a_tls_connection_whose_hostname_the_new_policy_allows() {
+    let presented = ["example.com", "EXAMPLE.com", "example.com.", "blocked.test"];
+
+    let ended = ended_by_narrowing(
+        &presented,
+        NetworkPolicy::builder()
+            .default_deny()
+            .egress(|e| e.allow_domains(["example.com"]))
+            .build()
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        ended,
+        ["blocked.test"],
+        "narrowing to allow only example.com ended the wrong connections"
     );
 }
