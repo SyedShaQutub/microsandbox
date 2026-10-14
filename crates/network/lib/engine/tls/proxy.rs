@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::sni;
 use super::state::TlsState;
-use crate::engine::http_deny::{classify_http_request, http_forbidden_response};
+use crate::engine::http_deny::classify_http_request;
 use crate::netstack::shared::SharedState;
 use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy::ResolvedOutboundProxy;
@@ -152,17 +152,21 @@ impl TlsProxy {
         } = self;
         let connect_dst = connect_target.primary();
 
-        // Buffer initial data to extract SNI from ClientHello. Timeout prevents a
+        // Buffer a complete ClientHello. Timeout prevents a
         // slow/malicious guest from holding a proxy slot indefinitely.
         let sni_name = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            extract_sni_from_channel(&mut from_smoltcp, initial_buf),
+            read_client_hello(&mut from_smoltcp, initial_buf),
         )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SNI extraction timed out"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ClientHello timed out"))?;
         let (sni_name, initial_buf) = sni_name?;
 
+        // Without SNI, authenticate the original destination IP, never a cached
+        // DNS name or the host-side address used for gateway forwarding.
         // Canonicalize so byte equality against rule destinations works.
+        let has_sni = sni_name.is_some();
+        let sni_name = sni_name.unwrap_or_else(|| guest_dst.ip().to_string());
         let sni_name = sni_name.trim_end_matches('.').to_ascii_lowercase();
         proxy_connect.record_hostname(&sni_name);
 
@@ -180,12 +184,18 @@ impl TlsProxy {
             return Ok(());
         }
 
-        // Apply Domain / DomainSuffix rules against the SNI.
+        // Policy uses cached DNS evidence when the client supplied no hostname.
+        // Certificate and secret identity remain bound to the destination IP.
+        let hostname_source = if has_sni {
+            HostnameSource::Sni(&sni_name)
+        } else {
+            HostnameSource::CacheOnly
+        };
         let eval = network_policy.evaluate_egress_with_source(
             guest_dst,
             Protocol::Tcp,
             &shared,
-            HostnameSource::Sni(&sni_name),
+            hostname_source,
         );
         if !matches!(eval, EgressEvaluation::Allow) {
             tracing::debug!(
@@ -221,7 +231,7 @@ impl TlsProxy {
                 guest_dst,
                 Protocol::Tcp,
                 &shared,
-                HostnameSource::Sni(&sni_name),
+                hostname_source,
             )
         {
             tracing::debug!(
@@ -348,10 +358,9 @@ pub(crate) async fn serve_tls_deny(
         return Ok(());
     }
 
-    let body = shared.http_deny_body(sni_name);
     guest_tls
         .writer()
-        .write_all(&http_forbidden_response(&body))
+        .write_all(&shared.network_denial_response(sni_name))
         .map_err(io::Error::other)?;
     guest_tls.send_close_notify();
     flush_to_guest(&mut guest_tls, to_smoltcp, shared, &mut tls_buf).await
@@ -534,15 +543,21 @@ pub(crate) async fn intercept_relay(
     // In TLS 1.3, the client sends Finished + application data in the same
     // flight, so process_new_packets() during the handshake loop may have
     // already decrypted the first HTTP request into the plaintext buffer.
-    forward_plaintext(
+    if let Err(error) = forward_plaintext(
         &mut guest_tls,
         &mut server_tls,
         &mut secrets_handler,
         &shared,
         &mut plaintext_buf,
+        false,
     )
-    .await?;
+    .await
+    {
+        flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+        return Err(error);
+    }
 
+    let mut upstream_response_started = false;
     let mut guest_eof = false;
     loop {
         tokio::select! {
@@ -572,14 +587,19 @@ pub(crate) async fn intercept_relay(
                     guest_tls
                         .process_new_packets()
                         .map_err(io::Error::other)?;
-                    forward_plaintext(
+                    if let Err(error) = forward_plaintext(
                         &mut guest_tls,
                         &mut server_tls,
                         &mut secrets_handler,
                         &shared,
                         &mut plaintext_buf,
+                        upstream_response_started,
                     )
-                    .await?;
+                    .await
+                    {
+                        flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+                        return Err(error);
+                    }
                 }
             }
 
@@ -588,6 +608,7 @@ pub(crate) async fn intercept_relay(
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
+                        upstream_response_started = true;
                         guest_tls
                             .writer()
                             .write_all(&server_buf[..n])
@@ -603,42 +624,60 @@ pub(crate) async fn intercept_relay(
     Ok(())
 }
 
-/// Buffer channel data until a complete ClientHello with SNI is received.
-///
-/// `seed` carries bytes already read from the channel before this call
-/// (e.g. bytes trailing a CONNECT request). Pass an empty `Vec` when no
-/// bytes have been pre-consumed.
-pub(crate) async fn extract_sni_from_channel(
+/// Read a ClientHello, preserving its bytes for the TLS relay.
+/// A complete hello without SNI is distinct from malformed or incomplete TLS.
+pub(crate) async fn read_client_hello(
     from_smoltcp: &mut mpsc::Receiver<Bytes>,
     seed: Vec<u8>,
-) -> io::Result<(String, Vec<u8>)> {
+) -> io::Result<(Option<String>, Vec<u8>)> {
     let mut initial_buf = seed;
-    initial_buf.reserve(CLIENT_HELLO_BUF_SIZE.saturating_sub(initial_buf.len()));
+    let mut acceptor = rustls::server::Acceptor::default();
+    let mut consumed = 0;
     loop {
-        if let Some(name) = sni::extract_sni(&initial_buf) {
-            return Ok((name, initial_buf));
-        }
-        if initial_buf.len() >= CLIENT_HELLO_BUF_SIZE {
+        if initial_buf.len() > CLIENT_HELLO_BUF_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "ClientHello too large or no SNI found",
+                "ClientHello too large",
             ));
+        }
+
+        // Bypass must remain usable for TLS clients rustls cannot terminate
+        // (for example TLS 1.1 without signature_algorithms). Preserve the
+        // existing wire-level SNI peek before asking rustls to validate TLS.
+        if let Some(hello) = sni::parse_client_hello(&initial_buf) {
+            // Match rustls: IP literals and invalid DNS names are absent SNI.
+            let name = hello.server_name.filter(|name| {
+                matches!(
+                    ServerName::try_from(name.as_str()),
+                    Ok(ServerName::DnsName(_))
+                )
+            });
+            return Ok((name, initial_buf));
+        }
+
+        while consumed < initial_buf.len() {
+            let read = acceptor.read_tls(&mut &initial_buf[consumed..])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete ClientHello",
+                ));
+            }
+            consumed += read;
+            match acceptor.accept() {
+                Ok(Some(accepted)) => {
+                    let name = accepted.client_hello().server_name().map(str::to_owned);
+                    return Ok((name, initial_buf));
+                }
+                Ok(None) => {}
+                Err((error, _)) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
         }
         let data = from_smoltcp
             .recv()
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "channel closed"))?;
         initial_buf.extend_from_slice(&data);
-
-        if let Some(name) = sni::extract_sni(&initial_buf) {
-            return Ok((name, initial_buf));
-        }
-        if initial_buf.len() >= CLIENT_HELLO_BUF_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ClientHello too large or no SNI found",
-            ));
-        }
     }
 }
 
@@ -651,6 +690,7 @@ async fn forward_plaintext(
     secrets_handler: &mut SecretsHandler,
     shared: &SharedState,
     buf: &mut [u8],
+    upstream_response_started: bool,
 ) -> io::Result<()> {
     let mut wrote_plaintext = false;
 
@@ -676,9 +716,18 @@ async fn forward_plaintext(
                 }
             }
             Err(action) => {
-                // Secret policy rejected the request. Drop the connection.
+                // Stop upstream forwarding. Only answer before any upstream
+                // response bytes have reached the guest; the caller flushes
+                // the denial and close_notify before dropping the connection.
                 if matches!(action, SecretViolationAction::BlockAndTerminate) {
                     shared.trigger_termination();
+                } else if shared.secret_deny_response_enabled()
+                    && !upstream_response_started
+                    && let Some(response) =
+                        secrets_handler.http1_violation_response(shared.secret_deny_message())
+                {
+                    guest_tls.writer().write_all(&response)?;
+                    guest_tls.send_close_notify();
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -793,6 +842,7 @@ mod tests {
             let shared = SharedState::new(16);
             shared.set_http_config(microsandbox_types::HttpConfig {
                 deny_response: enabled,
+                deny_response_format: microsandbox_types::HttpDenyResponseFormat::Json,
                 ..Default::default()
             });
             serve_tls_deny(
@@ -883,7 +933,12 @@ mod tests {
         )
         .await;
         assert!(response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
-        assert!(String::from_utf8_lossy(&response).contains("blocked.example"));
+        let text = std::str::from_utf8(&response).unwrap();
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+        let error: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(error["code"], "network_policy_denied");
+        assert_eq!(error["domain"], "blocked.example");
+        assert_eq!(error["message"], "Request blocked by network policy.");
     }
 
     #[tokio::test(start_paused = true)]
@@ -944,6 +999,354 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn client_hello_preserves_fragmented_records_with_and_without_sni() {
+        for name in ["example.com", "192.0.2.1", "2001:db8::1"] {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from(name.to_owned()).unwrap(),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            // Fragment the handshake over TLS records as well as channel messages.
+            let mut wire = Vec::new();
+            for fragment in hello[5..].chunks(31) {
+                wire.extend_from_slice(&hello[..3]);
+                wire.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
+                wire.extend_from_slice(fragment);
+            }
+            let (tx, mut rx) = mpsc::channel(wire.len());
+            for fragment in wire.chunks(7) {
+                tx.send(Bytes::copy_from_slice(fragment)).await.unwrap();
+            }
+            drop(tx);
+            let (sni, buffered) = read_client_hello(&mut rx, Vec::new()).await.unwrap();
+            assert_eq!(sni.as_deref(), (name == "example.com").then_some(name));
+            assert_eq!(buffered, wire);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_hello_rejects_invalid_and_truncated_tls() {
+        for wire in [
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            vec![0x16, 3, 1, 0, 10, 1],
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(Bytes::from(wire)).await.unwrap();
+            drop(tx);
+            assert!(read_client_hello(&mut rx, Vec::new()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn no_sni_policy_uses_cached_hostname_for_allow_and_deny() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (allowed, strict) in [(true, false), (false, false), (true, true), (false, true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            let shared = Arc::new(SharedState::new(8));
+            shared.set_http_config(microsandbox_types::HttpConfig {
+                deny_response: false,
+                ..Default::default()
+            });
+            shared.cache_resolved_hostname(
+                "example.com",
+                crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
+                [upstream.ip()],
+                Duration::from_secs(60),
+            );
+            let policy = if allowed {
+                NetworkPolicy::none().allow_domain("example.com").unwrap()
+            } else {
+                NetworkPolicy::allow_all()
+                    .deny_domain("example.com")
+                    .unwrap()
+            };
+            let state = Arc::new(isolated_tls_state(
+                TlsConfig {
+                    bypass: vec![upstream.ip().to_string()],
+                    ..Default::default()
+                },
+                SecretsHandle::new(SecretsConfig::default()),
+            ));
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(config),
+                ServerName::IpAddress(upstream.ip().into()),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let received =
+                run_bypass_probe(listener, state, shared, policy, strict, hello.clone()).await;
+            assert_eq!(
+                received,
+                if allowed && !strict {
+                    hello
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_sni_interception_allows_cached_domain_policy() {
+        let check = async {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let (address, request_rx, server) = spawn_upstream_request_sink().await;
+            let shared = Arc::new(SharedState::new(8));
+            shared.cache_resolved_hostname(
+                "example.com",
+                crate::netstack::shared::ResolvedHostnameFamily::Ipv4,
+                [address.ip()],
+                Duration::from_secs(60),
+            );
+            let state = test_tls_state(SecretsConfig::default());
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(state.intercept_ca.cert_der.clone()).unwrap();
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(config),
+                ServerName::IpAddress(address.ip().into()),
+            )
+            .unwrap();
+            let (from_tx, from_rx) = mpsc::channel(8);
+            let (to_tx, mut to_rx) = mpsc::channel(8);
+            let proxy = TlsProxy::new(
+                None,
+                address,
+                UpstreamTcpTarget::direct(address),
+                from_rx,
+                to_tx,
+                shared,
+                state,
+                Arc::new(NetworkPolicy::none().allow_domain("example.com").unwrap()),
+                true,
+                Arc::new(ProxyConnectState::new()),
+                None,
+            );
+            let relay = tokio::spawn(proxy.try_run());
+            send_client_tls_output(&mut client, &from_tx).await;
+            complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+            let request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+            client.writer().write_all(request).unwrap();
+            send_client_tls_output(&mut client, &from_tx).await;
+            assert_eq!(request_rx.await.unwrap(), request);
+            drop(from_tx);
+            while to_rx.recv().await.is_some() {}
+            relay.await.unwrap().unwrap();
+            server.await.unwrap().unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bypass_preserves_legacy_tls_without_signature_algorithms() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (name, fragmented) in [
+            (Some("example.com"), false),
+            (None, false),
+            (Some("example.com"), true),
+            (None, true),
+        ] {
+            let mut hello = legacy_client_hello(name);
+            if fragmented {
+                let mut wire = Vec::new();
+                for fragment in hello[5..].chunks(17) {
+                    wire.extend_from_slice(&hello[..3]);
+                    wire.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
+                    wire.extend_from_slice(fragment);
+                }
+                hello = wire;
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let state = Arc::new(isolated_tls_state(
+                TlsConfig {
+                    bypass: vec![name.unwrap_or("127.0.0.1").into()],
+                    ..Default::default()
+                },
+                SecretsHandle::new(SecretsConfig::default()),
+            ));
+            let received = run_bypass_probe(
+                listener,
+                state,
+                Arc::new(SharedState::new(8)),
+                NetworkPolicy::allow_all(),
+                false,
+                hello.clone(),
+            )
+            .await;
+            assert_eq!(received, hello);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_hello_treats_invalid_dns_names_as_absent() {
+        for name in [
+            "",
+            "a..b",
+            "-example.com",
+            "example.123",
+            "é.example",
+            &"a".repeat(254),
+        ] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let hello = legacy_client_hello(Some(name));
+            tx.send(Bytes::from(hello.clone())).await.unwrap();
+            drop(tx);
+            let (name, buffered) = read_client_hello(&mut rx, Vec::new()).await.unwrap();
+            assert_eq!(name, None);
+            assert_eq!(buffered, hello);
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_sni_cannot_replace_the_policy_hostname() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("blocked.example").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        // Skip record/handshake headers, version/random, session ID, ciphers,
+        // and compression methods to find the extensions length.
+        let mut extensions_offset = 9 + 34;
+        extensions_offset += 1 + hello[extensions_offset] as usize;
+        let length = u16::from_be_bytes([hello[extensions_offset], hello[extensions_offset + 1]]);
+        extensions_offset += 2 + length as usize;
+        extensions_offset += 1 + hello[extensions_offset] as usize;
+        let other = legacy_client_hello(Some("allowed.example"));
+        let mut sni_offset = extensions_offset + 2;
+        while hello[sni_offset..sni_offset + 2] != [0, 0] {
+            let size = u16::from_be_bytes([hello[sni_offset + 2], hello[sni_offset + 3]]);
+            sni_offset += 4 + size as usize;
+        }
+
+        // Preserve the first policy hostname while rejecting malformed lists
+        // and duplicate names, whether inside one extension or across two.
+        for (same_extension, malformed) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut wire = hello.clone();
+            if same_extension {
+                let old_length =
+                    u16::from_be_bytes([wire[sni_offset + 2], wire[sni_offset + 3]]) as usize;
+                let end = sni_offset + 4 + old_length;
+                let mut entry = other[58..].to_vec();
+                if malformed {
+                    entry[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
+                }
+                wire.splice(end..end, entry.iter().copied());
+                let size = (old_length + entry.len()) as u16;
+                wire[sni_offset + 2..sni_offset + 4].copy_from_slice(&size.to_be_bytes());
+                wire[sni_offset + 4..sni_offset + 6].copy_from_slice(&(size - 2).to_be_bytes());
+            } else {
+                let second = wire.len();
+                wire.extend_from_slice(&other[52..]);
+                if malformed {
+                    wire[second + 2..second + 4].copy_from_slice(&u16::MAX.to_be_bytes());
+                }
+            }
+            let size = (wire.len() - 5) as u16;
+            wire[3..5].copy_from_slice(&size.to_be_bytes());
+            let size = (wire.len() - 9) as u32;
+            wire[6..9].copy_from_slice(&size.to_be_bytes()[1..]);
+            let size = (wire.len() - extensions_offset - 2) as u16;
+            wire[extensions_offset..extensions_offset + 2].copy_from_slice(&size.to_be_bytes());
+            assert_eq!(sni::extract_sni(&wire).as_deref(), Some("blocked.example"));
+            let (tx, mut rx) = mpsc::channel(1);
+            tx.send(Bytes::from(wire)).await.unwrap();
+            drop(tx);
+            assert!(
+                read_client_hello(&mut rx, Vec::new()).await.is_err(),
+                "same_extension={same_extension}, malformed={malformed}"
+            );
+        }
+    }
+
+    fn legacy_client_hello(name: Option<&str>) -> Vec<u8> {
+        // TLS 1.1: RSA cipher and null compression, without signature_algorithms.
+        let mut body = vec![3, 2];
+        body.extend_from_slice(&[0; 32]);
+        body.extend_from_slice(&[0, 0, 2, 0, 0x2f, 1, 0]);
+        if let Some(name) = name {
+            let name = name.as_bytes();
+            body.extend_from_slice(&((name.len() + 9) as u16).to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(&((name.len() + 5) as u16).to_be_bytes());
+            body.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+            body.push(0);
+            body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            body.extend_from_slice(name);
+        }
+        let mut hello = vec![0x16, 3, 2];
+        hello.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        hello.push(1);
+        hello.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hello.extend_from_slice(&body);
+        hello
+    }
+
+    async fn run_bypass_probe(
+        listener: TcpListener,
+        state: Arc<TlsState>,
+        shared: Arc<SharedState>,
+        policy: NetworkPolicy,
+        strict: bool,
+        hello: Vec<u8>,
+    ) -> Vec<u8> {
+        let address = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(address).await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = accept_with_deadline(listener).await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let (tx, rx) = mpsc::channel(hello.len());
+        let (to_tx, _to_rx) = mpsc::channel(1);
+        for fragment in hello.chunks(7) {
+            tx.send(Bytes::copy_from_slice(fragment)).await.unwrap();
+        }
+        drop(tx);
+        let proxy = TlsProxy::new(
+            Some(stream),
+            address,
+            UpstreamTcpTarget::direct(address),
+            rx,
+            to_tx,
+            shared,
+            state,
+            Arc::new(policy),
+            strict,
+            Arc::new(ProxyConnectState::new()),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(2), proxy.try_run())
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap()
     }
 
     fn guest_client(tls_state: &TlsState) -> rustls::ClientConnection {
@@ -1057,6 +1460,167 @@ mod tests {
             }
         });
         (address, request_rx, server)
+    }
+
+    #[tokio::test]
+    async fn secret_denial_is_delivered_inside_the_existing_tls_connection() {
+        let check = async {
+            for (enabled, streamed, response_started) in [
+                (true, false, false),
+                (false, false, false),
+                (true, true, false),
+                (true, true, true),
+            ] {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let mut secrets = host_bound_secret_config();
+                secrets.secrets[0].allowed_hosts = vec![HostPattern::Exact("github.com".into())];
+                let tls_state = test_tls_state(secrets);
+                let shared = Arc::new(SharedState::new(8));
+                shared.set_http_config(microsandbox_types::HttpConfig {
+                    deny_response: enabled,
+                    deny_response_format: microsandbox_types::HttpDenyResponseFormat::Json,
+                    ..Default::default()
+                });
+                let headers = b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 8\r\n\r\n";
+                let early_response = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nhello";
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream = listener.local_addr().unwrap();
+                let (headers_tx, headers_rx) = oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let stream = accept_with_deadline(listener).await.unwrap();
+                    let mut stream = TlsAcceptor::from(upstream_server_config())
+                        .accept(stream)
+                        .await
+                        .unwrap();
+                    if streamed {
+                        let mut received = vec![0; headers.len()];
+                        stream.read_exact(&mut received).await.unwrap();
+                        assert_eq!(received, headers);
+                    }
+                    let _ = headers_tx.send(());
+                    if response_started {
+                        stream.write_all(early_response).await.unwrap();
+                        stream.flush().await.unwrap();
+                    }
+                    let mut rejected = Vec::new();
+                    match stream.read_to_end(&mut rejected).await {
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                            ) => {}
+                        Err(error) => panic!("upstream read failed: {error}"),
+                    }
+                    assert!(
+                        rejected.is_empty(),
+                        "blocked TLS request bytes reached upstream"
+                    );
+                });
+                let (from_tx, from_rx) = mpsc::channel(8);
+                let (to_tx, mut to_rx) = mpsc::channel(8);
+                let mut client = guest_client(&tls_state);
+                send_client_tls_output(&mut client, &from_tx).await;
+                let relay = tokio::spawn(intercept_relay(
+                    "203.0.113.10:443".parse().unwrap(),
+                    UpstreamTcpTarget::direct(upstream),
+                    "example.com",
+                    true,
+                    Vec::new(),
+                    from_rx,
+                    to_tx,
+                    shared,
+                    tls_state,
+                    Arc::new(ProxyConnectState::new()),
+                    None,
+                    None,
+                ));
+                if streamed {
+                    complete_relay_handshake(&mut client, &from_tx, &mut to_rx).await;
+                    // Fragment the headers across TLS records before delivering the body.
+                    client.writer().write_all(&headers[..12]).unwrap();
+                    send_client_tls_output(&mut client, &from_tx).await;
+                    client.writer().write_all(&headers[12..]).unwrap();
+                    send_client_tls_output(&mut client, &from_tx).await;
+                    headers_rx.await.unwrap();
+                    if response_started {
+                        let mut received = Vec::new();
+                        while received.len() < early_response.len() {
+                            let bytes = to_rx.recv().await.unwrap();
+                            client.read_tls(&mut bytes.as_ref()).unwrap();
+                            client.process_new_packets().unwrap();
+                            let mut buf = [0; 1024];
+                            while let Ok(n) = client.reader().read(&mut buf) {
+                                if n == 0 {
+                                    break;
+                                }
+                                received.extend_from_slice(&buf[..n]);
+                            }
+                        }
+                        assert_eq!(received, early_response);
+                    }
+                    client.writer().write_all(b"$MSB_KEY").unwrap();
+                    send_client_tls_output(&mut client, &from_tx).await;
+                } else {
+                    // Coalesce the request with the guest's TLS Finished flight,
+                    // exercising plaintext already buffered during the handshake.
+                    while client.is_handshaking() {
+                        let bytes = to_rx.recv().await.unwrap();
+                        client.read_tls(&mut bytes.as_ref()).unwrap();
+                        client.process_new_packets().unwrap();
+                        if !client.is_handshaking() {
+                            client.writer().write_all(headers).unwrap();
+                            client.writer().write_all(b"$MSB_KEY").unwrap();
+                        }
+                        send_client_tls_output(&mut client, &from_tx).await;
+                    }
+                }
+                let mut response = Vec::new();
+                let mut clean_close = false;
+                while let Some(bytes) = to_rx.recv().await {
+                    client.read_tls(&mut bytes.as_ref()).unwrap();
+                    clean_close |= client.process_new_packets().unwrap().peer_has_closed();
+                    let mut buf = [0; 1024];
+                    loop {
+                        match client.reader().read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => response.extend_from_slice(&buf[..n]),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("denial TLS read failed: {error}"),
+                        }
+                    }
+                }
+                assert!(
+                    relay.await.unwrap().is_err(),
+                    "secret request must remain blocked"
+                );
+                server.await.unwrap();
+                if enabled && !response_started {
+                    assert!(
+                        response.starts_with(b"HTTP/1.1 403 Forbidden\r\n"),
+                        "{response:?}"
+                    );
+                    let body = String::from_utf8(response).unwrap();
+                    let (_, json) = body.split_once("\r\n\r\n").unwrap();
+                    let error: serde_json::Value = serde_json::from_str(json).unwrap();
+                    assert_eq!(error["code"], "secret_policy_denied");
+                    assert_eq!(error["domain"], "example.com");
+                    assert!(!body.contains("real-secret-value") && !body.contains("$MSB_KEY"));
+                    assert!(
+                        clean_close,
+                        "guest must receive TLS close_notify after the denial"
+                    );
+                } else {
+                    assert!(
+                        response.is_empty(),
+                        "must not append a denial: {response:?}"
+                    );
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), check)
+            .await
+            .expect("TLS secret denial fixture timed out");
     }
 
     #[tokio::test]

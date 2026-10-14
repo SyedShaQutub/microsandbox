@@ -87,6 +87,18 @@ Sources and checks:
 
 Required review should include golden encoded payload bytes when serialization changes. Schema snapshots protect the protocol inventory, but they do not freeze every payload's encoded representation.
 
+### Execution output backpressure
+
+Buffering is unlimited by default (`exec.buffer_bytes: null`). A configured limit
+enables generation-10 output credit. The new SDK negotiates
+support before including `output_window` or sending `core.exec.output.credit`.
+Older guests continue to receive the unchanged execution request and produce
+unthrottled output; the SDK warns only when a configured limit cannot apply to
+that connection. Older SDKs omit the window and retain their original behavior with
+new guests. No existing sandbox must restart, and no launcher, disk, catalog, or
+snapshot format changes. A new agent running behind an independently older relay
+needs separate validation because input-credit scheduling is relay-owned.
+
 ## 2. Bootstrap, Init, and Guest Runtime Contract
 
 The first current-protocol host frame is `core.bootstrap` with message ID zero and no flags. The guest then reports resolved init state, the relay installs identity mappings, the host acknowledges init, and only then may the guest become ready.
@@ -371,6 +383,8 @@ Normal x86 boot now declares `krun.poweroff=i8042` in libkrun's default kernel c
 Strict hostname policy is enabled by default. The v0.6.0–v0.6.17 launch gate rejects strict policies containing outbound hostname allow rules, including domain suffixes and rules applying in both directions. Policies without those rules retain their existing behavior on older runtimes because strict enforcement is unused. Explicit `strict: false` remains supported.
 
 Observable network behavior is an effective compatibility contract. It includes default MTU, sandbox-slot address derivation, IPv4 subnet sizing, guest and gateway offsets, IPv6 prefixes, deterministic MAC addresses, interface name `eth0`, `host.microsandbox.internal`, DNS UDP and TCP behavior, DNS-over-TLS, TLS interception and trust paths, published-port binding, TCP half-close, UDP peer lifetime, destination policy, and host-side secret placeholder substitution.
+
+Omitted HTTP denial settings now default to enabled + JSON, including in older payloads and saved configs. Denied requests may return `403` instead of a connection error; callers must check status. Set `deny_response: false` for silent closure or `deny_response_format: text` for legacy bodies and `{host}` substitution. JSON requires the `http_deny_json` runtime capability. Cloud behavior is unchanged. See [denial responses](docs/networking/overview.mdx#what-a-denied-http-request-sees) for message settings and protocol limits.
 
 Network idle sleep is bounded by the existing one-second cleanup deadline and any earlier stack or deferred-close deadline, with packet and proxy events still waking it immediately.
 
