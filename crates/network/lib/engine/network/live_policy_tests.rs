@@ -438,3 +438,40 @@ async fn narrowing_keeps_a_tls_connection_whose_hostname_the_new_policy_allows()
         "narrowing to allow only example.com ended the wrong connections"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hostname_denied_after_a_split_client_hello_ends_its_connection() {
+    let port = host_service().await;
+    let mut network = running_network(NetworkPolicy::allow_all());
+    let policy = network.policy_handle();
+    let mut guest = Guest::attach(&mut network);
+    network.start(tokio::runtime::Handle::current());
+
+    let open = guest
+        .open_to_host(port)
+        .await
+        .expect("the open policy refused it");
+    let hello = build_client_hello("blocked.test");
+    guest.send(open, &hello[..10]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    guest.send(open, &hello[10..]).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        guest.state(open),
+        tcp::State::Established,
+        "the connection ended before the policy changed"
+    );
+    policy.set(
+        NetworkPolicy::builder()
+            .default_allow()
+            .egress(|e| e.deny_domains(["blocked.test"]))
+            .build()
+            .unwrap(),
+    );
+
+    assert!(
+        guest.ends(open).await,
+        "a connection whose ClientHello arrived in two segments stayed open after its name \
+         was denied"
+    );
+}
