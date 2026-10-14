@@ -39,50 +39,6 @@ struct Guest {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Trait Implementations
-//--------------------------------------------------------------------------------------------------
-
-impl Device for GuestDevice {
-    type RxToken<'a> = GuestRx;
-    type TxToken<'a> = GuestTx<'a>;
-
-    fn receive(&mut self, _: Instant) -> Option<(GuestRx, GuestTx<'_>)> {
-        let mut frame = vec![0; 2048];
-        match self.0.read_frame(&mut frame) {
-            Ok(len) => Some((GuestRx(frame[12..len].to_vec()), GuestTx(self))),
-            Err(ReadError::NothingRead) => None,
-            Err(error) => panic!("reading guest frame: {error:?}"),
-        }
-    }
-
-    fn transmit(&mut self, _: Instant) -> Option<GuestTx<'_>> {
-        Some(GuestTx(self))
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.medium = Medium::Ethernet;
-        capabilities.max_transmission_unit = 1514;
-        capabilities
-    }
-}
-
-impl RxToken for GuestRx {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(&self.0)
-    }
-}
-
-impl TxToken for GuestTx<'_> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut frame = vec![0; 12 + len];
-        let result = f(&mut frame[12..]);
-        self.0.0.write_frame(12, &mut frame).unwrap();
-        result
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
 
@@ -220,6 +176,54 @@ impl Guest {
         false
     }
 }
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Device for GuestDevice {
+    type RxToken<'a> = GuestRx;
+    type TxToken<'a> = GuestTx<'a>;
+
+    fn receive(&mut self, _: Instant) -> Option<(GuestRx, GuestTx<'_>)> {
+        let mut frame = vec![0; 2048];
+        match self.0.read_frame(&mut frame) {
+            Ok(len) => Some((GuestRx(frame[12..len].to_vec()), GuestTx(self))),
+            Err(ReadError::NothingRead) => None,
+            Err(error) => panic!("reading guest frame: {error:?}"),
+        }
+    }
+
+    fn transmit(&mut self, _: Instant) -> Option<GuestTx<'_>> {
+        Some(GuestTx(self))
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.medium = Medium::Ethernet;
+        capabilities.max_transmission_unit = 1514;
+        capabilities
+    }
+}
+
+impl RxToken for GuestRx {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.0)
+    }
+}
+
+impl TxToken for GuestTx<'_> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        let mut frame = vec![0; 12 + len];
+        let result = f(&mut frame[12..]);
+        self.0.0.write_frame(12, &mut frame).unwrap();
+        result
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
 
 /// A host service the guest can dial through its gateway; it accepts every connection.
 async fn host_service() -> u16 {
